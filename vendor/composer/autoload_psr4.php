@@ -6,5 +6,5 @@ $vendorDir = dirname(__DIR__);
 $baseDir = dirname($vendorDir);
 
 return array(
-    'Migration\\' => array($baseDir . '/src/Migration'),
+    'Mlp\\MigrationTool\\' => array($baseDir . '/src'),
 );

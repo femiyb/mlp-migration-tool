@@ -1,13 +1,13 @@
 {
-    "name": "femi/mlp-migration-tool",
-    "description": "MLP 2 → MLP 5 migration tool",
+    "name": "mlp/migration-tool",
+    "description": "Migrate WPML or Polylang sites to MultilingualPress multisite setup.",
+    "type": "wordpress-plugin",
     "license": "GPL-2.0-or-later",
-    "require": {
-        "php": ">=8.0"
-    },
     "autoload": {
         "psr-4": {
-            "Migration\\": "src/Migration/"
+            "Mlp\\MigrationTool\\": "src/"
         }
-    }
+    },
+    "minimum-stability": "stable",
+    "require": {}
 }
