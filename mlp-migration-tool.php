@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: MLP Migration Tool (PoC)
- * Description: Proof of concept for migrating Polylang sites to Multisite + MLP.
+ * Description: Proof of concept for migrating Polylang or WPML sites to Multisite + MLP.
  * Version: 0.5.0
  * Author: Your Name
  */
@@ -51,21 +51,55 @@ function mlp_render_admin_page() {
 
 add_action( 'mlp_run_poc_action', function () {
 
-    if ( ! function_exists( 'pll_the_languages' ) ) {
-        mlp_log_action( '❌ Polylang not detected.', 'error' );
+    // Detect source plugin: Polylang or WPML.
+    $source = null;
+
+    $has_polylang = function_exists( 'pll_the_languages' );
+    $has_wpml     = defined( 'ICL_SITEPRESS_VERSION' ) && function_exists( 'icl_object_id' );
+
+    if ( $has_polylang && $has_wpml ) {
+        mlp_log_action( '❌ Both Polylang and WPML detected. Please deactivate one source plugin before running the migration.', 'error' );
         return;
     }
 
-    $pll_languages = pll_the_languages( [ 'raw' => 1 ] );
-    if ( empty( $pll_languages ) ) {
-        mlp_log_action( '⚠️ Polylang detected but no languages found.', 'warning' );
+    if ( $has_polylang ) {
+        $source = 'polylang';
+    } elseif ( $has_wpml ) {
+        $source = 'wpml';
+    }
+
+    if ( ! $source ) {
+        mlp_log_action( '❌ Neither Polylang nor WPML detected.', 'error' );
         return;
     }
 
-    $slugs        = array_keys( $pll_languages );
-    $default_lang = function_exists( 'pll_default_language' ) ? pll_default_language() : '';
+    $pll_languages  = [];
+    $wpml_languages = [];
+    $slugs          = [];
+    $default_lang   = '';
 
-    mlp_log_action( '✅ Found Polylang languages: ' . implode( ', ', $slugs ), 'success' );
+    if ( $source === 'polylang' ) {
+        $pll_languages = pll_the_languages( [ 'raw' => 1 ] );
+        if ( empty( $pll_languages ) ) {
+            mlp_log_action( '⚠️ Polylang detected but no languages found.', 'warning' );
+            return;
+        }
+        $slugs        = array_keys( $pll_languages );
+        $default_lang = function_exists( 'pll_default_language' ) ? pll_default_language() : '';
+
+        mlp_log_action( '✅ Found Polylang languages: ' . implode( ', ', $slugs ), 'success' );
+    } else {
+        // WPML.
+        $wpml_languages = apply_filters( 'wpml_active_languages', null, [ 'skip_missing' => 0 ] );
+        if ( empty( $wpml_languages ) || ! is_array( $wpml_languages ) ) {
+            mlp_log_action( '⚠️ WPML detected but no languages found.', 'warning' );
+            return;
+        }
+        $slugs        = array_keys( $wpml_languages );
+        $default_lang = apply_filters( 'wpml_default_language', null );
+
+        mlp_log_action( '✅ Found WPML languages: ' . implode( ', ', $slugs ), 'success' );
+    }
 
     try {
         $siteRelations    = resolve( SiteRelations::class );
@@ -120,9 +154,15 @@ add_action( 'mlp_run_poc_action', function () {
         try {
             $siteSettingsRepository = resolve( \Inpsyde\MultilingualPress\Core\Admin\SiteSettingsRepository::class );
 
-            // Use the Polylang locale to set both the WordPress and MLP language.
+            // Use the source plugin's locale to set both the WordPress and MLP language.
             // This matches how MultilingualPress initializes site languages.
-            $locale = isset( $pll_languages[ $lang ]['locale'] ) ? $pll_languages[ $lang ]['locale'] : '';
+            $locale = '';
+
+            if ( $source === 'polylang' && isset( $pll_languages[ $lang ]['locale'] ) ) {
+                $locale = $pll_languages[ $lang ]['locale']; // e.g. en_US
+            } elseif ( $source === 'wpml' && isset( $wpml_languages[ $lang ]['default_locale'] ) ) {
+                $locale = $wpml_languages[ $lang ]['default_locale']; // e.g. en_US
+            }
 
             if ( $locale ) {
                 // Set the WordPress site language (WPLANG) for this site.
@@ -131,7 +171,7 @@ add_action( 'mlp_run_poc_action', function () {
                 // MLP expects a BCP-47 tag (e.g. en-US) in its site settings.
                 $mlp_lang = str_replace( '_', '-', $locale );
             } else {
-                // Fallback: treat Polylang slug as BCP-47-ish tag.
+                // Fallback: treat language slug as BCP-47-ish tag.
                 $mlp_lang = $lang;
             }
 
@@ -218,12 +258,31 @@ add_action( 'mlp_run_poc_action', function () {
     foreach ( $post_types as $post_type ) {
         foreach ( $slugs as $lang ) {
             switch_to_blog( get_main_site_id() );
-            $items = get_posts( [
-                'numberposts' => -1,
-                'post_type'   => $post_type,
-                'post_status' => 'publish',
-                'lang'        => $lang,
-            ] );
+
+            if ( $source === 'polylang' ) {
+                $items = get_posts( [
+                    'numberposts' => -1,
+                    'post_type'   => $post_type,
+                    'post_status' => 'publish',
+                    'lang'        => $lang,
+                ] );
+            } else {
+                // WPML: switch language context, query posts, then switch back.
+                if ( $lang && $lang !== $default_lang ) {
+                    do_action( 'wpml_switch_language', $lang );
+                }
+
+                $items = get_posts( [
+                    'numberposts' => -1,
+                    'post_type'   => $post_type,
+                    'post_status' => 'publish',
+                ] );
+
+                if ( $default_lang ) {
+                    do_action( 'wpml_switch_language', $default_lang );
+                }
+            }
+
             restore_current_blog();
 
             if ( $items && isset( $site_map[$lang] ) ) {
@@ -253,8 +312,8 @@ add_action( 'mlp_run_poc_action', function () {
                             'success'
                         );
 
-                        // Use Polylang to fetch translations of this post (all on the main site).
-                        $translations = pll_get_post_translations( $item->ID );
+                        // Fetch translations of this post (all on the main site) for the active source.
+                        $translations = mlp_get_translations_for_post( $source, $item->ID, $post_type );
                         $relation_map = [];
 
                         foreach ( $translations as $t_lang => $t_post_id ) {
@@ -299,3 +358,45 @@ add_action( 'mlp_run_poc_action', function () {
         }
     }
 });
+
+/**
+ * Fetch translations for a given post from the active source plugin.
+ *
+ * @param string $source    'polylang' or 'wpml'.
+ * @param int    $post_id   Original post ID on the main site.
+ * @param string $post_type Post type (post, page, etc.).
+ *
+ * @return array<string,int> Map of language code => post ID.
+ */
+function mlp_get_translations_for_post( $source, $post_id, $post_type ) {
+    if ( $source === 'polylang' && function_exists( 'pll_get_post_translations' ) ) {
+        $translations = pll_get_post_translations( $post_id );
+
+        return is_array( $translations ) ? $translations : [];
+    }
+
+    if ( $source === 'wpml' ) {
+        $element_type = 'post_' . $post_type;
+        $trid         = apply_filters( 'wpml_element_trid', null, $post_id, $element_type );
+
+        if ( ! $trid ) {
+            return [];
+        }
+
+        $wpml_translations = apply_filters( 'wpml_get_element_translations', null, $trid, $element_type );
+        if ( ! is_array( $wpml_translations ) ) {
+            return [];
+        }
+
+        $translations = [];
+        foreach ( $wpml_translations as $lang_code => $t ) {
+            if ( ! empty( $t->element_id ) ) {
+                $translations[ $lang_code ] = (int) $t->element_id;
+            }
+        }
+
+        return $translations;
+    }
+
+    return [];
+}
