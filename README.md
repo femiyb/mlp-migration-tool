@@ -17,9 +17,8 @@ At the moment this is intended for **internal / agency use**, not as a polished 
 
 - **Polylang**
   - Uses `pll_the_languages()`, `pll_default_language()`, `pll_get_post_translations()`, and the `lang` query var.
-- **WPML**
-  - Uses `wpml_active_languages`, `wpml_default_language`, `wpml_switch_language`, `wpml_element_trid`, and `wpml_get_element_translations`.
-- If **both** Polylang and WPML are active, the tool aborts with an error and does nothing.
+- **WPML** (experimental)
+  - Uses `icl_translations` table directly to discover translation groups (`trid`) and their posts.
 
 ## Requirements
 

@@ -253,57 +253,251 @@ add_action( 'mlp_run_poc_action', function () {
         }
     }
 
-    // Now migrate posts/pages per language
+    // WPML: use translation groups from icl_translations and exit early.
+    if ( $source === 'wpml' ) {
+        global $wpdb;
+
+        $post_types = [ 'post', 'page' ];
+        $groups     = [];
+        $seen_ids   = [];
+        $table      = $wpdb->prefix . 'icl_translations';
+
+        $element_types = [];
+        foreach ( $post_types as $post_type ) {
+            $element_types[] = 'post_' . $post_type;
+        }
+
+        $in_element_types = "'" . implode( "', '", array_map( 'esc_sql', $element_types ) ) . "'";
+
+        $rows = $wpdb->get_results( "
+            SELECT trid, element_id, language_code, element_type
+            FROM {$table}
+            WHERE element_type IN ( {$in_element_types} )
+        " );
+
+        if ( $rows ) {
+            foreach ( $rows as $row ) {
+                $trid         = (int) $row->trid;
+                $post_id      = (int) $row->element_id;
+                $lang_code    = (string) $row->language_code;
+                $element_type = (string) $row->element_type;
+
+                if ( ! $trid || ! $post_id || ! $lang_code ) {
+                    continue;
+                }
+                if ( strpos( $element_type, 'post_' ) !== 0 ) {
+                    continue;
+                }
+
+                $post_type = substr( $element_type, 5 ); // Strip "post_".
+
+                if ( ! isset( $groups[ $post_type ] ) ) {
+                    $groups[ $post_type ] = [];
+                }
+                if ( ! isset( $seen_ids[ $post_type ] ) ) {
+                    $seen_ids[ $post_type ] = [];
+                }
+
+                $seen_ids[ $post_type ][ $post_id ] = true;
+                if ( ! isset( $groups[ $post_type ][ $trid ] ) ) {
+                    $groups[ $post_type ][ $trid ] = [];
+                }
+
+                // One post per language per TRID; last one wins for duplicates.
+                $groups[ $post_type ][ $trid ][ $lang_code ] = $post_id;
+            }
+        }
+
+        // Add default-language-only posts that are not in any WPML translation group.
+        foreach ( $post_types as $post_type ) {
+            $seen_for_type = isset( $seen_ids[ $post_type ] ) ? array_keys( $seen_ids[ $post_type ] ) : [];
+            $seen_for_type = array_map( 'absint', $seen_for_type );
+
+            $placeholders = '';
+            if ( $seen_for_type ) {
+                $placeholders = implode( ',', $seen_for_type );
+            }
+
+            $post_query = "
+                SELECT ID
+                FROM {$wpdb->posts}
+                WHERE post_type = %s
+                  AND post_status = 'publish'
+            ";
+
+            if ( $placeholders ) {
+                $post_query .= " AND ID NOT IN ( {$placeholders} )";
+            }
+
+            $extra_posts = $wpdb->get_col( $wpdb->prepare( $post_query, $post_type ) );
+
+            if ( $extra_posts ) {
+                foreach ( $extra_posts as $post_id ) {
+                    $post_id = (int) $post_id;
+
+                    if ( ! isset( $groups[ $post_type ] ) ) {
+                        $groups[ $post_type ] = [];
+                    }
+
+                    // Treat as default-language content with no translations.
+                    $synthetic_trid = -1 * $post_id; // Unique negative ID per post.
+                    $groups[ $post_type ][ $synthetic_trid ] = [
+                        $default_lang => $post_id,
+                    ];
+                }
+            }
+        }
+
+        foreach ( $post_types as $post_type ) {
+            if ( empty( $groups[ $post_type ] ) ) {
+                continue;
+            }
+
+            foreach ( $groups[ $post_type ] as $trid => $translations ) {
+                $relation_map = [];
+
+                if ( count( $translations ) > 1 ) {
+                    // Real translation set: one post per language.
+                    foreach ( $translations as $lang_code => $post_id ) {
+                        if ( ! isset( $site_map[ $lang_code ] ) ) {
+                            continue;
+                        }
+
+                        $site_id = $site_map[ $lang_code ];
+
+                        // Main site keeps the original post.
+                        if ( $site_id === get_main_site_id() ) {
+                            $relation_map[ $site_id ] = $post_id;
+                            continue;
+                        }
+
+                        // Copy the language-specific post to its language site.
+                        switch_to_blog( get_main_site_id() );
+                        $source_post = get_post( $post_id );
+                        restore_current_blog();
+
+                        if ( ! $source_post ) {
+                            continue;
+                        }
+
+                        switch_to_blog( $site_id );
+                        $new_id = wp_insert_post( [
+                            'post_title'   => $source_post->post_title,
+                            'post_content' => $source_post->post_content,
+                            'post_status'  => $source_post->post_status,
+                            'post_type'    => $source_post->post_type,
+                        ] );
+                        restore_current_blog();
+
+                        if ( ! $new_id ) {
+                            continue;
+                        }
+
+                        $relation_map[ $site_id ] = $new_id;
+
+                        mlp_log_action(
+                            "➡️ Copied {$post_type} '{$source_post->post_title}' ({$lang_code}) to site {$site_id} (New ID: {$new_id})",
+                            'success'
+                        );
+                    }
+                } else {
+                    // Single-language content: duplicate to all language sites, but DO NOT link them in MLP.
+                    $post_id = reset( $translations );
+
+                    switch_to_blog( get_main_site_id() );
+                    $source_post = get_post( $post_id );
+                    restore_current_blog();
+
+                    if ( ! $source_post ) {
+                        continue;
+                    }
+
+                    foreach ( $slugs as $lang_code ) {
+                        if ( ! isset( $site_map[ $lang_code ] ) ) {
+                            continue;
+                        }
+
+                        $site_id = $site_map[ $lang_code ];
+
+                        if ( $site_id === get_main_site_id() ) {
+                            // Keep original on main site; no relation is created for this group.
+                            continue;
+                        }
+
+                        switch_to_blog( $site_id );
+                        $new_id = wp_insert_post( [
+                            'post_title'   => $source_post->post_title,
+                            'post_content' => $source_post->post_content,
+                            'post_status'  => $source_post->post_status,
+                            'post_type'    => $source_post->post_type,
+                        ] );
+                        restore_current_blog();
+
+                        if ( ! $new_id ) {
+                            continue;
+                        }
+
+                        mlp_log_action(
+                            "➡️ Duplicated single-language {$post_type} '{$source_post->post_title}' to site {$site_id} (New ID: {$new_id})",
+                            'success'
+                        );
+                    }
+                }
+
+                $content_type = ( $post_type === 'page' ) ? 'post' : $post_type;
+
+                if ( count( $relation_map ) > 1 ) {
+                    try {
+                        $relationId = $contentRelations->createRelationship( $relation_map, $content_type );
+                        mlp_log_action(
+                            "🔗 Linked {$post_type} (TRID {$trid}) across sites (Relation ID: {$relationId})",
+                            'info'
+                        );
+                    } catch ( Exception $e ) {
+                        mlp_log_action(
+                            "❌ Failed to link TRID {$trid}: " . $e->getMessage(),
+                            'error'
+                        );
+                    }
+                }
+            }
+        }
+
+        return;
+    }
+
+    // Polylang: migrate posts/pages per language.
     $post_types = [ 'post', 'page' ];
     foreach ( $post_types as $post_type ) {
         foreach ( $slugs as $lang ) {
             switch_to_blog( get_main_site_id() );
-
-            if ( $source === 'polylang' ) {
-                $items = get_posts( [
-                    'numberposts' => -1,
-                    'post_type'   => $post_type,
-                    'post_status' => 'publish',
-                    'lang'        => $lang,
-                ] );
-            } else {
-                // WPML: switch language context, query posts, then switch back.
-                if ( $lang && $lang !== $default_lang ) {
-                    do_action( 'wpml_switch_language', $lang );
-                }
-
-                $items = get_posts( [
-                    'numberposts' => -1,
-                    'post_type'   => $post_type,
-                    'post_status' => 'publish',
-                ] );
-
-                if ( $default_lang ) {
-                    do_action( 'wpml_switch_language', $default_lang );
-                }
-            }
-
+            $items = get_posts( [
+                'numberposts' => -1,
+                'post_type'   => $post_type,
+                'post_status' => 'publish',
+                'lang'        => $lang,
+            ] );
             restore_current_blog();
 
-            if ( $items && isset( $site_map[$lang] ) ) {
+            if ( $items && isset( $site_map[ $lang ] ) ) {
                 foreach ( $items as $item ) {
-                    $target_site = $site_map[$lang];
+                    $target_site = $site_map[ $lang ];
                     if ( $target_site === get_main_site_id() ) {
                         continue; // skip default, it's already there
                     }
 
                     switch_to_blog( $target_site );
                     add_filter( 'pll_get_the_post_types', '__return_empty_array' );
-                    $new_id = wp_insert_post([
+                    $new_id = wp_insert_post( [
                         'post_title'   => $item->post_title,
                         'post_content' => $item->post_content,
                         'post_status'  => $item->post_status,
                         'post_type'    => $item->post_type,
-                    ]);
+                    ] );
                     remove_filter( 'pll_get_the_post_types', '__return_empty_array' );
                     restore_current_blog();
 
-                                        if ( $new_id ) {
+                    if ( $new_id ) {
                         // Remember which new post ID belongs to which site + original post.
                         $new_posts[ $target_site ][ $item->ID ] = $new_id;
 
@@ -312,8 +506,8 @@ add_action( 'mlp_run_poc_action', function () {
                             'success'
                         );
 
-                        // Fetch translations of this post (all on the main site) for the active source.
-                        $translations = mlp_get_translations_for_post( $source, $item->ID, $post_type );
+                        // Use Polylang to fetch translations of this post (all on the main site).
+                        $translations = pll_get_post_translations( $item->ID );
                         $relation_map = [];
 
                         foreach ( $translations as $t_lang => $t_post_id ) {
@@ -358,45 +552,3 @@ add_action( 'mlp_run_poc_action', function () {
         }
     }
 });
-
-/**
- * Fetch translations for a given post from the active source plugin.
- *
- * @param string $source    'polylang' or 'wpml'.
- * @param int    $post_id   Original post ID on the main site.
- * @param string $post_type Post type (post, page, etc.).
- *
- * @return array<string,int> Map of language code => post ID.
- */
-function mlp_get_translations_for_post( $source, $post_id, $post_type ) {
-    if ( $source === 'polylang' && function_exists( 'pll_get_post_translations' ) ) {
-        $translations = pll_get_post_translations( $post_id );
-
-        return is_array( $translations ) ? $translations : [];
-    }
-
-    if ( $source === 'wpml' ) {
-        $element_type = 'post_' . $post_type;
-        $trid         = apply_filters( 'wpml_element_trid', null, $post_id, $element_type );
-
-        if ( ! $trid ) {
-            return [];
-        }
-
-        $wpml_translations = apply_filters( 'wpml_get_element_translations', null, $trid, $element_type );
-        if ( ! is_array( $wpml_translations ) ) {
-            return [];
-        }
-
-        $translations = [];
-        foreach ( $wpml_translations as $lang_code => $t ) {
-            if ( ! empty( $t->element_id ) ) {
-                $translations[ $lang_code ] = (int) $t->element_id;
-            }
-        }
-
-        return $translations;
-    }
-
-    return [];
-}
