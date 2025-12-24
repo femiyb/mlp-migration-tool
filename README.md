@@ -18,7 +18,9 @@ At the moment this is intended for **internal / agency use**, not as a polished 
 - **Polylang**
   - Uses `pll_the_languages()`, `pll_default_language()`, `pll_get_post_translations()`, and the `lang` query var.
 - **WPML** (experimental)
-  - Uses `icl_translations` table directly to discover translation groups (`trid`) and their posts.
+  - Uses the `icl_translations` table to discover translation groups (`trid`) and their posts.
+  - For real translation sets (posts available in multiple languages), copies each language’s post to its site and links them in MultilingualPress.
+  - For single-language content (no translations in WPML), duplicates the post to all language sites but does **not** create MultilingualPress relationships between those copies.
 
 ## Requirements
 
@@ -44,7 +46,7 @@ At the moment this is intended for **internal / agency use**, not as a polished 
 - Only migrates **posts** and **pages**; no custom post types, taxonomies, menus, or widgets yet.
 - Designed as a **one‑way, one‑time** migration helper; it is not idempotent or reversible.
 - Assumes the original site is the **main site** of the network and contains all source content.
-- No UI for configuration; behavior is mostly hard‑coded and should be treated as a developer tool.
+- Very minimal UI: a single button to run the migration and a log of actions; advanced options might require code changes.
 
 ## Safety notes
 
