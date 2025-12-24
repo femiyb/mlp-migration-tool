@@ -14,21 +14,15 @@ use Inpsyde\MultilingualPress\Framework\Api\SiteRelations;
 use Inpsyde\MultilingualPress\Framework\Api\ContentRelations;
 use function Inpsyde\MultilingualPress\resolve;
 
-add_action( 'admin_menu', function () {
-    add_menu_page(
-        'MLP Migration Tool',
-        'MLP Migration',
-        'manage_options',
-        'mlp-migration',
-        'mlp_render_admin_page',
-        'dashicons-migrate',
-        80
-    );
-});
-
 function mlp_log_action( $message, $type = 'info' ) {
-    $class = 'notice notice-' . $type;
-    echo '<div class="' . esc_attr( $class ) . '"><p>' . esc_html( $message ) . '</p></div>';
+    if ( ! isset( $GLOBALS['mlp_migration_logs'] ) || ! is_array( $GLOBALS['mlp_migration_logs'] ) ) {
+        $GLOBALS['mlp_migration_logs'] = [];
+    }
+
+    $GLOBALS['mlp_migration_logs'][] = [
+        'type'    => $type,
+        'message' => $message,
+    ];
 }
 
 function mlp_render_admin_page() {
@@ -40,7 +34,18 @@ function mlp_render_admin_page() {
     ?>
     <div class="wrap">
         <h1>MLP Migration Tool (PoC)</h1>
-        <p>This will create subsites for Polylang languages, migrate content, and link them with MLP.</p>
+        <p>This will create subsites for Polylang or WPML languages, migrate content, and link them with MLP.</p>
+
+        <?php
+        if ( ! empty( $GLOBALS['mlp_migration_logs'] ) && is_array( $GLOBALS['mlp_migration_logs'] ) ) {
+            foreach ( $GLOBALS['mlp_migration_logs'] as $log ) {
+                $type  = isset( $log['type'] ) ? $log['type'] : 'info';
+                $class = 'notice notice-' . $type;
+                echo '<div class="' . esc_attr( $class ) . '"><p>' . esc_html( $log['message'] ) . '</p></div>';
+            }
+        }
+        ?>
+
         <form method="post">
             <?php wp_nonce_field( 'mlp_migration_poc_action', 'mlp_migration_poc_nonce' ); ?>
             <?php submit_button( 'Run PoC Migration', 'primary', 'mlp_migration_poc' ); ?>
@@ -48,6 +53,23 @@ function mlp_render_admin_page() {
     </div>
     <?php
 }
+
+// Register the migration UI as a top-level page in the Network Admin.
+add_action( 'network_admin_menu', function () {
+    if ( ! is_multisite() ) {
+        return;
+    }
+
+    add_menu_page(
+        'MLP Migration Tool (PoC)', // Page title.
+        'MLP Migration',            // Menu title.
+        'manage_network_options',   // Capability.
+        'mlp-migration',            // Menu slug (?page=mlp-migration).
+        'mlp_render_admin_page',    // Callback.
+        'dashicons-migrate',
+        80
+    );
+} );
 
 add_action( 'mlp_run_poc_action', function () {
 
