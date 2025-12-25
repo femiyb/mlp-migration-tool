@@ -489,6 +489,9 @@ add_action( 'mlp_run_poc_action', function () {
     }
 
     // Polylang: migrate posts/pages per language.
+    // Behaviour mirrors the WPML branch:
+    // - Posts with translations are copied only to their language site and linked via MLP.
+    // - Single-language posts (no translations) are duplicated to all language sites, but NOT linked.
     $post_types = [ 'post', 'page' ];
     foreach ( $post_types as $post_type ) {
         foreach ( $slugs as $lang ) {
@@ -501,73 +504,122 @@ add_action( 'mlp_run_poc_action', function () {
             ] );
             restore_current_blog();
 
-            if ( $items && isset( $site_map[ $lang ] ) ) {
-                foreach ( $items as $item ) {
-                    $target_site = $site_map[ $lang ];
-                    if ( $target_site === get_main_site_id() ) {
-                        continue; // skip default, it's already there
+            if ( ! $items || ! isset( $site_map[ $lang ] ) ) {
+                continue;
+            }
+
+            foreach ( $items as $item ) {
+                // Determine Polylang translations on the source (main) site.
+                $translations = function_exists( 'pll_get_post_translations' )
+                    ? (array) pll_get_post_translations( $item->ID )
+                    : [];
+
+                // Single-language content: duplicate to all language sites, but DO NOT link in MLP.
+                if ( count( $translations ) <= 1 ) {
+                    foreach ( $slugs as $dup_lang ) {
+                        if ( ! isset( $site_map[ $dup_lang ] ) ) {
+                            continue;
+                        }
+
+                        $dup_site_id = $site_map[ $dup_lang ];
+
+                        // Keep the original on the main site only.
+                        if ( $dup_site_id === get_main_site_id() ) {
+                            continue;
+                        }
+
+                        switch_to_blog( $dup_site_id );
+                        add_filter( 'pll_get_the_post_types', '__return_empty_array' );
+                        $dup_id = wp_insert_post( [
+                            'post_title'   => $item->post_title,
+                            'post_content' => $item->post_content,
+                            'post_status'  => $item->post_status,
+                            'post_type'    => $item->post_type,
+                        ] );
+                        remove_filter( 'pll_get_the_post_types', '__return_empty_array' );
+                        restore_current_blog();
+
+                        if ( $dup_id ) {
+                            $new_posts[ $dup_site_id ][ $item->ID ] = $dup_id;
+
+                            mlp_log_action(
+                                "➡️ Duplicated single-language {$post_type} '{$item->post_title}' to site {$dup_site_id} (New ID: {$dup_id})",
+                                'success'
+                            );
+                        }
                     }
 
-                    switch_to_blog( $target_site );
-                    add_filter( 'pll_get_the_post_types', '__return_empty_array' );
-                    $new_id = wp_insert_post( [
-                        'post_title'   => $item->post_title,
-                        'post_content' => $item->post_content,
-                        'post_status'  => $item->post_status,
-                        'post_type'    => $item->post_type,
-                    ] );
-                    remove_filter( 'pll_get_the_post_types', '__return_empty_array' );
-                    restore_current_blog();
+                    // Nothing more to do for this single-language post.
+                    continue;
+                }
 
-                    if ( $new_id ) {
-                        // Remember which new post ID belongs to which site + original post.
-                        $new_posts[ $target_site ][ $item->ID ] = $new_id;
+                $target_site = $site_map[ $lang ];
+                if ( $target_site === get_main_site_id() ) {
+                    // Default language content is already on the main site; translations
+                    // will be copied from their respective language loops.
+                    continue;
+                }
 
+                switch_to_blog( $target_site );
+                add_filter( 'pll_get_the_post_types', '__return_empty_array' );
+                $new_id = wp_insert_post( [
+                    'post_title'   => $item->post_title,
+                    'post_content' => $item->post_content,
+                    'post_status'  => $item->post_status,
+                    'post_type'    => $item->post_type,
+                ] );
+                remove_filter( 'pll_get_the_post_types', '__return_empty_array' );
+                restore_current_blog();
+
+                if ( ! $new_id ) {
+                    continue;
+                }
+
+                // Remember which new post ID belongs to which site + original post.
+                $new_posts[ $target_site ][ $item->ID ] = $new_id;
+
+                mlp_log_action(
+                    "➡️ Copied {$post_type} '{$item->post_title}' to site {$target_site} (New ID: {$new_id})",
+                    'success'
+                );
+
+                // Use Polylang to fetch translations of this post (all on the main site).
+                $relation_map = [];
+
+                foreach ( $translations as $t_lang => $t_post_id ) {
+                    if ( ! isset( $site_map[ $t_lang ] ) ) {
+                        continue;
+                    }
+
+                    $t_site_id = $site_map[ $t_lang ];
+
+                    // If we have already copied this translated post to its site, use that ID.
+                    if ( isset( $new_posts[ $t_site_id ][ $t_post_id ] ) ) {
+                        $relation_map[ $t_site_id ] = $new_posts[ $t_site_id ][ $t_post_id ];
+                        continue;
+                    }
+
+                    // If this is the main site, use the original Polylang post ID as fallback.
+                    if ( $t_site_id === get_main_site_id() ) {
+                        $relation_map[ $t_site_id ] = $t_post_id;
+                    }
+                }
+
+                // Normalize content type: treat pages as 'post' if needed.
+                $content_type = ( $post_type === 'page' ) ? 'post' : $post_type;
+
+                if ( count( $relation_map ) > 1 ) {
+                    try {
+                        $relationId = $contentRelations->createRelationship( $relation_map, $content_type );
                         mlp_log_action(
-                            "➡️ Copied {$post_type} '{$item->post_title}' to site {$target_site} (New ID: {$new_id})",
-                            'success'
+                            "🔗 Linked {$post_type} '{$item->post_title}' across sites (Relation ID: {$relationId})",
+                            'info'
                         );
-
-                        // Use Polylang to fetch translations of this post (all on the main site).
-                        $translations = pll_get_post_translations( $item->ID );
-                        $relation_map = [];
-
-                        foreach ( $translations as $t_lang => $t_post_id ) {
-                            if ( ! isset( $site_map[ $t_lang ] ) ) {
-                                continue;
-                            }
-
-                            $t_site_id = $site_map[ $t_lang ];
-
-                            // If we have already copied this translated post to its site, use that ID.
-                            if ( isset( $new_posts[ $t_site_id ][ $t_post_id ] ) ) {
-                                $relation_map[ $t_site_id ] = $new_posts[ $t_site_id ][ $t_post_id ];
-                                continue;
-                            }
-
-                            // If this is the main site, use the original Polylang post ID as fallback.
-                            if ( $t_site_id === get_main_site_id() ) {
-                                $relation_map[ $t_site_id ] = $t_post_id;
-                            }
-                        }
-
-                        // Normalize content type: treat pages as 'post' if needed.
-                        $content_type = ( $post_type === 'page' ) ? 'post' : $post_type;
-
-                        if ( count( $relation_map ) > 1 ) {
-                            try {
-                                $relationId = $contentRelations->createRelationship( $relation_map, $content_type );
-                                mlp_log_action(
-                                    "🔗 Linked {$post_type} '{$item->post_title}' across sites (Relation ID: {$relationId})",
-                                    'info'
-                                );
-                            } catch ( Exception $e ) {
-                                mlp_log_action(
-                                    "❌ Failed to link '{$item->post_title}': " . $e->getMessage(),
-                                    'error'
-                                );
-                            }
-                        }
+                    } catch ( Exception $e ) {
+                        mlp_log_action(
+                            "❌ Failed to link '{$item->post_title}': " . $e->getMessage(),
+                            'error'
+                        );
                     }
                 }
             }
